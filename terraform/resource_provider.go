@@ -1,5 +1,14 @@
 package terraform
 
+import (
+	"bytes"
+	"errors"
+	"fmt"
+
+	"github.com/blang/semver"
+	"github.com/hashicorp/terraform/config/module"
+)
+
 // ResourceProvider is an interface that must be implemented by any
 // resource provider: the thing that creates and manages the resources in
 // a Terraform configuration.
@@ -171,6 +180,50 @@ type DataSource struct {
 	Name string
 }
 
+// ResourceProviderResolver is an interface implemented by objects that are
+// able to resolve a given set of resource provider version constraints
+// into ResourceProviderFactory callbacks.
+type ResourceProviderResolver interface {
+	// Given a constraint map, return a ResourceProviderFactory for each
+	// requested provider. If some or all of the constraints cannot be
+	// satisfied, return a non-nil slice of errors describing the problems.
+	ResolveProviders(constraints map[string]semver.Range) (map[string]ResourceProviderFactory, []error)
+}
+
+// ResourceProviderResolverFunc wraps a callback function and turns it into
+// a ResourceProviderResolver implementation, for convenience in situations
+// where a function and its associated closure are sufficient as a resolver
+// implementation.
+type ResourceProviderResolverFunc func(constraints map[string]semver.Range) (map[string]ResourceProviderFactory, []error)
+
+// ResolveProviders implements ResourceProviderResolver by calling the
+// wrapped function.
+func (f ResourceProviderResolverFunc) ResolveProviders(constraints map[string]semver.Range) (map[string]ResourceProviderFactory, []error) {
+	return f(constraints)
+}
+
+// ResourceProviderResolverFixed returns a ResourceProviderResolver that
+// has a fixed set of provider factories provided by the caller. The returned
+// resolver ignores version constraints entirely and just returns the given
+// factory for each requested provider name.
+//
+// This function is primarily used in tests, to provide mock providers or
+// in-process providers under test.
+func ResourceProviderResolverFixed(factories map[string]ResourceProviderFactory) ResourceProviderResolver {
+	return ResourceProviderResolverFunc(func(constraints map[string]semver.Range) (map[string]ResourceProviderFactory, []error) {
+		ret := make(map[string]ResourceProviderFactory, len(constraints))
+		var errs []error
+		for name := range constraints {
+			if factory, exists := factories[name]; exists {
+				ret[name] = factory
+			} else {
+				errs = append(errs, fmt.Errorf("provider %q is not available", name))
+			}
+		}
+		return ret, errs
+	})
+}
+
 // ResourceProviderFactory is a function type that creates a new instance
 // of a resource provider.
 type ResourceProviderFactory func() (ResourceProvider, error)
@@ -201,4 +254,39 @@ func ProviderHasDataSource(p ResourceProvider, n string) bool {
 	}
 
 	return false
+}
+
+// resourceProviderFactories matches available plugins to constraints in
+// config to produce a map of compatible provider plugins if possible, or
+// an error if the currently-available plugins are insufficient.
+//
+// This should be called only with configurations that have passed calls
+// to config.Validate(), which ensures that all of the given version
+// constraints are valid. It will panic if any invalid constraints are present.
+func resourceProviderFactories(resolver ResourceProviderResolver, root *module.Tree) (map[string]ResourceProviderFactory, error) {
+	cons := make(map[string]semver.Range)
+	root.DeepEach(func(module *module.Tree) {
+		config := module.Config()
+		reqd := config.RequiredProviders().RequiredRanges()
+		for name, spec := range reqd {
+			if existing, exists := cons[name]; exists {
+				cons[name] = existing.AND(spec)
+			} else {
+				cons[name] = spec
+			}
+		}
+	})
+
+	ret, errs := resolver.ResolveProviders(cons)
+	if errs != nil {
+		errBuf := &bytes.Buffer{}
+		errBuf.WriteString("Can't satisfy provider requirements with currently-installed plugins:\n\n")
+		for _, err := range errs {
+			fmt.Fprintf(errBuf, "* %s\n", err)
+		}
+		errBuf.WriteString("\nRun 'terraform init' to install the necessary provider plugins.\n")
+		return nil, errors.New(errBuf.String())
+	}
+
+	return ret, nil
 }
