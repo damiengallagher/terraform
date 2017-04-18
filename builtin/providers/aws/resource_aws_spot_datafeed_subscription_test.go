@@ -27,6 +27,7 @@ func TestAccAWSSpotDatafeedSubscription(t *testing.T) {
 }
 
 func testAccAWSSpotDatafeedSubscription_basic(t *testing.T) {
+	t.Fatalf("Testing Subtests Fail with Output")
 	var subscription ec2.SpotDatafeedSubscription
 	ri := acctest.RandInt()
 
